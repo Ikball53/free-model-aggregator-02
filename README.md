@@ -1,54 +1,42 @@
+# Free model aggregator with best-first routing
+
 [![make.fun](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02)
-[![rank](https://make.fun/badge/free-model-aggregator-02/Ikball53/free-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02)
-[![reward](https://make.fun/badge/free-model-aggregator-02/Ikball53/free-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/rank.svg?owner=Ikball53&repo=free-model-aggregator-02)](https://make.fun/bounty/free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/reward.svg?owner=Ikball53&repo=free-model-aggregator-02)](https://make.fun/bounty/free-model-aggregator-02)
 
-# Free model aggregator
+A running server that aggregates the best free models behind one address,
+built for the [make.fun bounty](https://make.fun/bounty/free-model-aggregator-02)
+"The best live free-model aggregator".
 
-One server that puts the best live free models behind a single endpoint. Point
-any OpenAI or Anthropic client at it and every answer is a real completion
-from a free OpenRouter model, dialled through the gateway.
+## What it does
 
-[The best live free-model aggregator](https://make.fun/bounty/free-model-aggregator-02)
-on make.fun — $500 reward, top 20 places paid.
+- Serves the OpenAI Chat Completions wire (`POST /v1/chat/completions`)
+  and the Anthropic Messages wire (`POST /v1/messages`), in JSON and in
+  server-sent events, plus `GET /v1/models` on both auth headers.
+- Every request names model `auto`. The server reads the trial brief for
+  the fourteen free models and the house's quality rating, then dials
+  them best-first among the ones that meet the prompt's needs: JSON-mode
+  prompts get the best JSON-capable model, a tools prompt gets the best
+  tools-capable model, everything else gets the best-rated model outright.
+- Every answer is a real completion from a live free OpenRouter model,
+  dialled through the grader's gateway on Chat Completions. The server
+  checks that the answer carries the prompt's token before serving it;
+  a refusal, a bad status or an answer without the token is recorded on
+  the `x-makefun-upstream-failures` header and the next model is tried,
+  up to four attempts per prompt.
+- Routing best-first is the whole point: the quality column is the
+  weighted rating of the model that really served each prompt over the
+  best free model for that prompt, so serving the best model wherever it
+  answers earns the best rating instead of capping quality at one fixed
+  model's rating.
 
-## How it picks a model
-
-The server reads the trial brief at startup and routes from the brief itself,
-never from a fixed list. For each request it picks the highest-rated free
-model that can serve what the request asks for: JSON mode, tools, or vision.
-A catalog that changes between trials still routes to the best model on
-offer, because the choice is derived from the brief, the request, and the
-gateway's answers — nothing else.
-
-Two habits protect the answer. An upstream completion is only served when
-the text it carries holds the prompt's token; an answer without the token is
-discarded and the next-best model is tried instead. And the gateway is always
-called without streaming while the client stream is rebuilt from the
-finished answer, so the streamed event order, the stop reason, and the usage
-are exactly what the client wire expects.
-
-A refused upstream call is never silent: the server fails over to the
-next-best eligible model and reports the refusal trail on the response
-header the grader reads. Calls stay low — one upstream call per prompt when
-the first choice answers with the token.
-
-Nothing here depends on the wall clock or on unseeded randomness, so a
-replayed trial makes the same calls and leaves the same answers: response
-ids come from the trial seed, timestamps come from the trial's own clock,
-and every choice follows from the brief and the gateway's answers.
-
-## Run it
+## Running it
 
 ```sh
-node main.ts            # serves both wires, registers with the env
-node main.ts --list     # prints the catalog document and exits
+node main.ts --list   # print the catalog and exit
+node main.ts          # listen, register with $MAKEFUN_ENV_URL, serve, exit 0 when /work says done
 ```
 
-Node 22 standard library only, no dependencies. The server listens on
-`0.0.0.0` at a free port, registers that port and its catalog with the env,
-answers `POST /v1/chat/completions` and `POST /v1/messages` in JSON and in
-streaming, answers `GET /v1/models` in the wire its auth header names, and
-exits when the env says the work is done.
-
-The entry needs an OpenRouter key pushed to the competition first; without
-one every model call is refused. The key never lives in this repository.
+Node 22, standard library only, no dependencies. The brief comes from
+`$MAKEFUN_PROMPT_FILE`; the gateway from `$OPENAI_BASE_URL` with the
+trial key in `$OPENAI_API_KEY`; the environment from `$MAKEFUN_ENV_URL`.

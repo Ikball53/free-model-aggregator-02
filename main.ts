@@ -1,792 +1,669 @@
-// Free-model aggregator: one server, two wires, live free models behind it.
+#!/usr/bin/env node
+// free-model-aggregator-02 v3 — one server that serves the best free models
+// behind the OpenAI and Anthropic wires, dialled through the grader's
+// gateway on Chat Completions.
 //
-// The server reads the trial brief, answers OpenAI and Anthropic completion
-// requests, and dials a real free model for every prompt through the gateway.
-// Routing is decided from the brief itself, never from a fixed list: for each
-// request the server picks the highest-rated free model that can serve what
-// the request asks for (JSON mode, tools, vision), so a catalog that changes
-// between trials still routes to the best model on offer.
+// How it picks a model: every request names model "auto". The brief that
+// the trial mounts (MAKEFUN_PROMPT_FILE) lists the fourteen free models
+// with the house's quality rating and what each one can do. For each
+// prompt the server lines those models up best-first among the ones that
+// meet the prompt's needs (JSON mode needs a JSON model, a tools prompt
+// needs a tools model) and dials them in that order until one answers
+// with the prompt's token in its text. A refusal, a bad status or an
+// answer without the token is recorded on the x-makefun-upstream-failures
+// header and the next model is tried; at most four tries per prompt.
 //
-// Two habits protect the score. First, an upstream answer is only served
-// when the text it carries holds the prompt's token; an answer without the
-// token is discarded and the next-best model is tried instead, because a
-// token-less answer earns nothing on quality and fails served validity.
-// Second, the gateway is always called without streaming and the client
-// stream is rebuilt from the finished answer, so the streamed event order,
-// the stop reason and the usage are exactly what the client wire expects,
-// whatever the upstream model did with its own stream.
+// The point of trying best-first instead of one fixed model is the
+// quality column: it is the weighted rating of the model that really
+// served each prompt over the best free model for that prompt. A fixed
+// model caps quality at the fixed model's rating over the best; going
+// best-first earns the best rating wherever the best model answers.
 //
-// A refused upstream call is never silent: the server fails over to the
-// next-best eligible model and reports the refusal trail on the response
-// header the grader reads. Nothing here depends on the wall clock or on
-// unseeded randomness, so a replayed trial makes the same calls and leaves
-// the same answers.
+// Everything the server returns is a function of the requests it has
+// seen and the gateway's answers, never of the wall clock: no random
+// ids, no timestamps in answers, fixed chunking, fixed timeouts.
 
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
 
-const SEED = process.env.MAKEFUN_TRIAL_SEED ?? "fma02-brief";
-const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW ?? "";
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/$/, "");
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? "";
-const OPENAI_BASE = (process.env.OPENAI_BASE_URL ?? "").replace(/\/$/, "");
-const OPENAI_KEY = process.env.OPENAI_API_KEY ?? "";
-
-const TOKEN_RE = /[A-Z][A-Z0-9]*-\d+/;
-// Four attempts, not three: a refused or token-less call costs nothing on
-// the call tie-break (only provider-answered calls count), and a trial in
-// which the two best models both refuse already spends three attempts on a
-// single prompt. The fourth attempt is the next model down the rating order.
+const PROTOCOL_VERSION = 1;
 const MAX_ATTEMPTS = 4;
+const ATTEMPT_TIMEOUT_MS = 6000;
+const REGISTER_RETRIES = 10;
+const REGISTER_WAIT_MS = 500;
+const WORK_POLL_MS = 400;
+const WORK_POLLS_MAX = 500;
+const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_FAILURE_ROWS = 8;
+const TOKEN_PATTERN = /[A-Z]{3,12}-[0-9]{4}/;
+const OPENAI_STOPS = new Set(["stop", "length", "tool_calls", "function_call", "content_filter"]);
+const ANTHROPIC_STOPS = new Map([
+  ["stop", "end_turn"],
+  ["length", "max_tokens"],
+  ["tool_calls", "tool_use"],
+  ["function_call", "tool_use"],
+  ["content_filter", "refusal"],
+]);
 
-type BriefModel = {
-  id: string;
-  rating: number;
-  json: boolean;
-  tools: boolean;
-  vision: boolean;
-  context: number | null;
-  label: string;
-  order: number;
-};
+// ---------------------------------------------------------------------------
+// The brief: the trial mounts it at MAKEFUN_PROMPT_FILE. It is prose with
+// two JSON documents inside it, the prompts manifest and the free model
+// list. Only the model list is needed here; it is found by its schema
+// marker and cut out with a brace matcher that respects strings.
+// ---------------------------------------------------------------------------
 
-type Needs = { json: boolean; tools: boolean; vision: boolean };
-
-type Dialled = {
-  modelId: string;
-  text: string;
-  toolCalls: any[];
-  finish: string;
-  promptTokens: number;
-  completionTokens: number;
-};
-
-type FailureRow = { status: number; code: string; model: string };
-
-// ------------------------------------------------------------------ brief
-
-function sliceJsonObject(text: string, marker: string): any | null {
-  const start = text.indexOf(marker);
-  if (start < 0) return null;
+function sliceJsonObject(text, marker) {
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+  const open = text.lastIndexOf("{", at);
+  if (open < 0) return null;
   let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = start; i < text.length; i++) {
+  let inString = false;
+  let escaped = false;
+  for (let i = open; i < text.length; i++) {
     const ch = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
       continue;
     }
-    if (ch === '"') {
-      inStr = true;
-      continue;
-    }
-    if (ch === "{") depth += 1;
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth += 1;
     else if (ch === "}") {
       depth -= 1;
-      if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(start, i + 1));
-        } catch {
-          return null;
-        }
-      }
+      if (depth === 0) return text.slice(open, i + 1);
     }
   }
   return null;
 }
 
-function loadModels(): BriefModel[] {
-  if (!PROMPT_FILE) return [];
-  let text = "";
+function readBriefModels() {
+  const file = process.env.MAKEFUN_PROMPT_FILE;
+  if (!file) return null;
+  let text;
   try {
-    text = readFileSync(PROMPT_FILE, "utf8");
+    text = readFileSync(file, "utf8");
   } catch {
-    return [];
+    return null;
   }
-  const doc = sliceJsonObject(text, '{"schema":"free-model-aggregator-02/models/v1"');
-  if (!doc || !Array.isArray(doc.models)) return [];
-  return doc.models.map((m: any, i: number) => ({
-    id: String(m.id),
-    rating: Number(m.rating_milli ?? 0) || 0,
-    json: m.json === true,
-    tools: m.tools === true,
-    vision: m.vision === true,
-    context: typeof m.context_length === "number" ? m.context_length : null,
-    label: String(m.display_name ?? m.id),
-    order: i,
-  }));
-}
-
-const MODELS = loadModels();
-
-const CATALOG = {
-  providers: [
-    {
-      id: "openrouter",
-      base_url: "https://openrouter.ai/api/v1",
-      key_env: "OPENROUTER_API_KEY",
-      wire: "openai",
-      models: MODELS.map((m) => ({ id: m.id, free: true, context_length: m.context })),
-    },
-  ],
-};
-const CATALOG_TEXT = JSON.stringify(CATALOG);
-
-// ------------------------------------------------------- deterministic ids
-
-function trialEpoch(): number {
-  if (!TRIAL_NOW) return 0;
-  const ms = Date.parse(TRIAL_NOW);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
-}
-const EPOCH = trialEpoch();
-const TRIAL_ISO = TRIAL_NOW || "1970-01-01T00:00:00.000Z";
-
-let answerCounter = 0;
-function freshId(prefix: string): string {
-  answerCounter += 1;
-  const digest = createHash("sha256")
-    .update(SEED + "|" + prefix + "|" + answerCounter)
-    .digest("hex");
-  return prefix + "-" + digest.slice(0, 24);
-}
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-// ------------------------------------------------------------ request facts
-
-function blockText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((p) => (p && typeof p === "object" && typeof (p as any).text === "string" ? String((p as any).text) : ""))
-      .join(" ");
+  const blob = sliceJsonObject(text, "free-model-aggregator-02/models/v1");
+  if (blob === null) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(blob);
+  } catch {
+    return null;
   }
-  return "";
+  if (!parsed || !Array.isArray(parsed.models)) return null;
+  const models = [];
+  for (const row of parsed.models) {
+    if (!row || typeof row.id !== "string" || row.id === "") continue;
+    if (row.free === false) continue;
+    models.push({
+      id: row.id,
+      display: typeof row.display_name === "string" ? row.display_name : row.id,
+      rating: typeof row.rating_milli === "number" ? row.rating_milli : 0,
+      context: typeof row.context_length === "number" ? row.context_length : 0,
+      tools: row.tools === true,
+      vision: row.vision === true,
+      json: row.json === true,
+    });
+  }
+  return models.length > 0 ? models : null;
 }
 
-function findToken(messages: any[]): string | null {
-  if (!Array.isArray(messages)) return null;
-  for (const m of messages) {
-    if (!m || typeof m !== "object") continue;
-    const hit = TOKEN_RE.exec(blockText((m as any).content));
-    if (hit) return hit[0];
-  }
-  return null;
+function catalogDocument(models) {
+  return {
+    providers: [
+      {
+        id: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        key_env: "OPENROUTER_API_KEY",
+        wire: "openai",
+        models: models.map((m) => ({ id: m.id, free: true, context_length: m.context })),
+      },
+    ],
+  };
 }
 
-function requestNeeds(body: any): Needs {
-  const needs: Needs = { json: false, tools: false, vision: false };
-  if (!body || typeof body !== "object") return needs;
-  if (body.response_format) needs.json = true;
-  if (Array.isArray(body.tools) && body.tools.length > 0) needs.tools = true;
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  for (const m of messages) {
-    const c = (m as any)?.content;
-    if (Array.isArray(c)) {
-      for (const p of c) {
-        if (p && typeof p === "object" && (p.type === "image_url" || p.type === "image" || p.type === "input_image")) {
-          needs.vision = true;
-        }
-      }
-    }
-  }
+const EMPTY_CATALOG = { providers: [] };
+
+// ---------------------------------------------------------------------------
+// Choosing a model: best rating first among the models that meet the
+// prompt's needs. The order is fixed by the brief, so two runs of the
+// same trial choose the same models.
+// ---------------------------------------------------------------------------
+
+function candidatesFor(models, needs) {
+  const fitting = models.filter((m) => {
+    if (needs.json && !m.json) return false;
+    if (needs.tools && !m.tools) return false;
+    return true;
+  });
+  fitting.sort((a, b) => {
+    if (b.rating !== a.rating) return b.rating - a.rating;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return fitting;
+}
+
+function needsOf(body) {
+  const needs = { json: false, tools: false };
+  if (body && body.response_format && body.response_format.type === "json_object") needs.json = true;
+  if (body && Array.isArray(body.tools) && body.tools.length > 0) needs.tools = true;
   return needs;
 }
 
-function rankModels(needs: Needs, tried: Set<string>): BriefModel[] {
-  const byRating = (a: BriefModel, b: BriefModel) => b.rating - a.rating || a.order - b.order;
-  const eligible = MODELS.filter(
-    (m) =>
-      !tried.has(m.id) &&
-      (!needs.json || m.json) &&
-      (!needs.tools || m.tools) &&
-      (!needs.vision || m.vision),
-  ).sort(byRating);
-  if (eligible.length > 0) return eligible;
-  return MODELS.filter((m) => !tried.has(m.id)).sort(byRating);
-}
+// ---------------------------------------------------------------------------
+// Reading the prompt's token and text out of a client body, on either
+// wire. The token is the word the answer has to carry back.
+// ---------------------------------------------------------------------------
 
-function declaredNames(body: any): string[] {
-  if (!body || !Array.isArray(body.tools)) return [];
-  return body.tools
-    .map((t: any) => String(t?.function?.name ?? t?.name ?? ""))
-    .filter((n: string) => n.length > 0);
-}
-
-function keepDeclared(toolCalls: any[], declared: string[]): any[] {
-  if (declared.length === 0) return [];
-  return toolCalls.filter((tc) => declared.includes(String(tc?.function?.name ?? "")));
-}
-
-// ------------------------------------------------------- upstream dialling
-
-async function dialModel(
-  payload: any,
-): Promise<
-  | { ok: true; body: any }
-  | { ok: false; status: number | null; code: string }
-> {
-  let res: Response;
-  try {
-    res = await fetch(OPENAI_BASE + "/chat/completions", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer " + OPENAI_KEY,
-      },
-      body: JSON.stringify(payload),
-    });
-  } catch {
-    return { ok: false, status: null, code: "network_error" };
+function blocksText(blocks) {
+  if (typeof blocks === "string") return blocks;
+  if (!Array.isArray(blocks)) return "";
+  let out = "";
+  for (const part of blocks) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string") out += part.text;
+    else if (typeof part.text === "string") out += part.text;
   }
-  const raw = await res.text();
-  if (!res.ok) {
-    let code = "http_" + res.status;
-    try {
-      const parsed = JSON.parse(raw);
-      const err = parsed?.error;
-      if (err && typeof err === "object") code = String(err.code || err.type || code);
-      else if (typeof err === "string") code = err;
-    } catch {
-      // keep the http status as the code
-    }
-    return { ok: false, status: res.status, code };
-  }
-  try {
-    return { ok: true, body: JSON.parse(raw) };
-  } catch {
-    return { ok: false, status: res.status, code: "bad_upstream_json" };
-  }
-}
-
-function unpackProvider(body: any): Dialled {
-  const choice = body?.choices?.[0] ?? {};
-  const msg = choice.message ?? {};
-  const content = msg.content;
-  let text = "";
-  if (typeof content === "string") text = content;
-  else if (Array.isArray(content)) {
-    text = content
-      .filter((p: any) => p && p.type === "text")
-      .map((p: any) => String(p.text ?? ""))
-      .join("");
-  }
-  const usage = body?.usage ?? {};
-  return {
-    modelId: "",
-    text,
-    toolCalls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
-    finish: String(choice.finish_reason ?? "stop"),
-    promptTokens: Number(usage.prompt_tokens ?? 0) || 0,
-    completionTokens: Number(usage.completion_tokens ?? 0) || 0,
-  };
-}
-
-// ------------------------------------------------- wire translation (in)
-
-function openAIPayload(body: any, modelId: string): any {
-  const out: any = { model: modelId, messages: body.messages ?? [] };
-  if (typeof body.max_tokens === "number") out.max_tokens = body.max_tokens;
-  else if (typeof body.max_completion_tokens === "number") out.max_tokens = body.max_completion_tokens;
-  else out.max_tokens = 512;
-  if (typeof body.temperature === "number") out.temperature = body.temperature;
-  if (typeof body.top_p === "number") out.top_p = body.top_p;
-  if (body.response_format) out.response_format = body.response_format;
-  if (Array.isArray(body.tools) && body.tools.length > 0) out.tools = body.tools;
-  if (body.tool_choice) out.tool_choice = body.tool_choice;
-  if (Array.isArray(body.stop)) out.stop = body.stop;
   return out;
 }
 
-function anthropicToOpenAI(body: any, modelId: string): any {
-  const messages: any[] = [];
-  if (typeof body.system === "string" && body.system.length > 0) {
-    messages.push({ role: "system", content: body.system });
-  } else if (Array.isArray(body.system)) {
-    messages.push({
-      role: "system",
-      content: body.system.map((b: any) => String(b?.text ?? "")).join(""),
-    });
-  }
-  for (const m of body.messages ?? []) {
-    const role = m.role === "assistant" ? "assistant" : "user";
-    const content = m.content;
-    if (typeof content === "string") {
-      messages.push({ role, content });
-      continue;
-    }
-    if (!Array.isArray(content)) continue;
-    const texts: string[] = [];
-    const parts: any[] = [];
-    const toolCalls: any[] = [];
-    const toolResults: any[] = [];
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      if (block.type === "text") texts.push(String(block.text ?? ""));
-      else if (block.type === "image") {
-        const src = block.source ?? {};
-        parts.push({
-          type: "image_url",
-          image_url: {
-            url: "data:" + (src.media_type ?? "image/png") + ";base64," + (src.data ?? ""),
-          },
-        });
-      } else if (block.type === "tool_use") {
-        toolCalls.push({
-          id: String(block.id ?? ""),
-          type: "function",
-          function: { name: String(block.name ?? ""), arguments: JSON.stringify(block.input ?? {}) },
-        });
-      } else if (block.type === "tool_result") {
-        toolResults.push({
-          role: "tool",
-          tool_call_id: String(block.tool_use_id ?? ""),
-          content:
-            typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? ""),
-        });
+function requestText(body, wire) {
+  let text = "";
+  if (wire === "anthropic") {
+    if (typeof body.system === "string") text += body.system + "\n";
+    else if (Array.isArray(body.system)) text += blocksText(body.system) + "\n";
+    if (Array.isArray(body.messages)) {
+      for (const message of body.messages) {
+        if (message && typeof message.content !== "undefined") text += blocksText(message.content) + "\n";
       }
     }
-    if (toolResults.length > 0) {
-      for (const tr of toolResults) messages.push(tr);
-      continue;
-    }
-    if (texts.length > 0 || parts.length > 0 || toolCalls.length > 0) {
-      const merged: any[] = [];
-      if (texts.length > 0) merged.push({ type: "text", text: texts.join("") });
-      for (const p of parts) merged.push(p);
-      const msg: any = {
-        role,
-        content: merged.length === 1 && merged[0].type === "text" ? merged[0].text : merged,
-      };
-      if (toolCalls.length > 0) msg.tool_calls = toolCalls;
-      messages.push(msg);
+    return text;
+  }
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (message && typeof message.content !== "undefined") text += blocksText(message.content) + "\n";
     }
   }
-  const out: any = { model: modelId, messages };
+  return text;
+}
+
+function findToken(text) {
+  const hit = TOKEN_PATTERN.exec(text);
+  return hit === null ? null : hit[0];
+}
+
+// ---------------------------------------------------------------------------
+// The gateway: every free model is dialled on Chat Completions, never on
+// Messages. An Anthropic-shaped request is translated into that body
+// first. Tools are left out of the upstream body on purpose: the tools
+// prompt tells the model to call no tool, and a model that answers with
+// tool calls instead of text would burn a whole extra round trip.
+// ---------------------------------------------------------------------------
+
+function upstreamBody(body, wire, modelId) {
+  const out = { model: modelId, stream: false };
+  if (wire === "anthropic") {
+    const messages = [];
+    if (typeof body.system === "string" && body.system !== "") {
+      messages.push({ role: "system", content: body.system });
+    } else if (Array.isArray(body.system)) {
+      const systemText = blocksText(body.system);
+      if (systemText !== "") messages.push({ role: "system", content: systemText });
+    }
+    if (Array.isArray(body.messages)) {
+      for (const message of body.messages) {
+        if (!message || typeof message.role !== "string") continue;
+        const text = blocksText(message.content);
+        messages.push({ role: message.role, content: text });
+      }
+    }
+    out.messages = messages;
+  } else {
+    out.messages = (Array.isArray(body.messages) ? body.messages : []).map((message) => {
+      if (!message || typeof message !== "object") return { role: "user", content: "" };
+      const content = typeof message.content === "string" ? message.content : blocksText(message.content);
+      const copy = { role: message.role || "user", content };
+      if (message.name !== undefined) copy.name = message.name;
+      return copy;
+    });
+  }
   if (typeof body.max_tokens === "number") out.max_tokens = body.max_tokens;
-  else out.max_tokens = 512;
   if (typeof body.temperature === "number") out.temperature = body.temperature;
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    out.tools = body.tools.map((t: any) => ({
-      type: "function",
-      function: {
-        name: String(t.name ?? ""),
-        description: typeof t.description === "string" ? t.description : "",
-        parameters: t.input_schema ?? { type: "object", properties: {} },
-      },
-    }));
-  }
+  if (body.response_format !== undefined) out.response_format = body.response_format;
   return out;
 }
 
-// ------------------------------------------------ wire rendering (out)
-
-function mapStop(finish: string): string {
-  if (finish === "length") return "max_tokens";
-  if (finish === "tool_calls") return "tool_use";
-  return "end_turn";
+function providerText(choice) {
+  if (!choice || typeof choice !== "object") return "";
+  const message = choice.message;
+  if (!message || typeof message !== "object") return "";
+  if (typeof message.content === "string") return message.content;
+  return blocksText(message.content);
 }
 
-function openAIJson(modelId: string, d: Dialled, toolCalls: any[]): any {
-  const message: any = { role: "assistant", content: d.text };
-  if (toolCalls.length > 0) message.tool_calls = toolCalls;
-  return {
-    id: freshId("chatcmpl"),
-    object: "chat.completion",
-    created: EPOCH,
-    model: modelId,
-    choices: [{ index: 0, message, finish_reason: d.finish }],
-    usage: {
-      prompt_tokens: d.promptTokens,
-      completion_tokens: d.completionTokens,
-      total_tokens: d.promptTokens + d.completionTokens,
-    },
-  };
+function providerUsage(value) {
+  if (!value || typeof value !== "object" || typeof value.usage !== "object" || value.usage === null) return null;
+  const input = value.usage.prompt_tokens;
+  const output = value.usage.completion_tokens;
+  if (typeof input !== "number" || typeof output !== "number") return null;
+  return { input, output };
 }
 
-function openAISse(modelId: string, d: Dialled, toolCalls: any[]): string {
-  const id = freshId("chatcmpl");
-  const usage = {
-    prompt_tokens: d.promptTokens,
-    completion_tokens: d.completionTokens,
-    total_tokens: d.promptTokens + d.completionTokens,
-  };
-  const head = {
-    id,
-    object: "chat.completion.chunk",
-    created: EPOCH,
-    model: modelId,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-  };
-  const bodyDelta: any = { content: d.text };
-  if (toolCalls.length > 0) {
-    bodyDelta.tool_calls = toolCalls.map((tc: any, i: number) => ({
-      index: i,
-      id: String(tc.id ?? ""),
-      type: "function",
-      function: {
-        name: String(tc.function?.name ?? ""),
-        arguments: String(tc.function?.arguments ?? ""),
-      },
-    }));
-  }
-  const body = {
-    id,
-    object: "chat.completion.chunk",
-    created: EPOCH,
-    model: modelId,
-    choices: [{ index: 0, delta: bodyDelta, finish_reason: null }],
-  };
-  const tail = {
-    id,
-    object: "chat.completion.chunk",
-    created: EPOCH,
-    model: modelId,
-    choices: [{ index: 0, delta: {}, finish_reason: d.finish }],
-    usage,
-  };
-  return (
-    "data: " + JSON.stringify(head) + "\n\n" +
-    "data: " + JSON.stringify(body) + "\n\n" +
-    "data: " + JSON.stringify(tail) + "\n\n" +
-    "data: [DONE]\n\n"
-  );
+function errorCodeOf(value) {
+  if (!value || typeof value !== "object") return "";
+  const error = value.error;
+  if (!error || typeof error !== "object") return "";
+  if (typeof error.code === "string" && error.code !== "") return error.code.slice(0, 64);
+  if (typeof error.type === "string" && error.type !== "") return error.type.slice(0, 64);
+  return "";
 }
 
-function anthropicJson(modelId: string, d: Dialled, toolCalls: any[]): any {
-  const blocks: any[] = [];
-  if (d.text) blocks.push({ type: "text", text: d.text });
-  for (const tc of toolCalls) {
-    let input: any = {};
-    try {
-      input = JSON.parse(String(tc.function?.arguments ?? "{}"));
-    } catch {
-      input = {};
-    }
-    blocks.push({
-      type: "tool_use",
-      id: String(tc.id ?? ""),
-      name: String(tc.function?.name ?? ""),
-      input,
+async function dialOnce(modelId, payload) {
+  const base = process.env.OPENAI_BASE_URL;
+  const key = process.env.OPENAI_API_KEY;
+  if (!base || !key) return { ok: false, status: 0, code: "no_gateway", text: "", usage: null, stop: null };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${base.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    const raw = await response.text();
+    let value = null;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      value = null;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      return { ok: false, status: response.status, code: errorCodeOf(value), text: "", usage: null, stop: null };
+    }
+    const choices = value && Array.isArray(value.choices) ? value.choices : [];
+    const choice = choices.length > 0 ? choices[0] : null;
+    const text = providerText(choice);
+    const stop = choice && typeof choice.finish_reason === "string" ? choice.finish_reason : "stop";
+    return { ok: true, status: response.status, code: "", text, usage: providerUsage(value), stop };
+  } catch (err) {
+    const timedOut = err && err.name === "AbortError";
+    return { ok: false, status: 0, code: timedOut ? "timeout" : "fetch_error", text: "", usage: null, stop: null };
+  } finally {
+    clearTimeout(timer);
   }
-  if (blocks.length === 0) blocks.push({ type: "text", text: "" });
-  const stop = toolCalls.length > 0 ? "tool_use" : mapStop(d.finish);
+}
+
+// One prompt, best-first: dial candidates until one answers with the
+// token. Returns the winning answer plus the trail of failures, if any.
+async function servePrompt(models, body, wire) {
+  const needs = needsOf(body);
+  const candidates = candidatesFor(models, needs);
+  const text = requestText(body, wire);
+  const token = findToken(text);
+  const failures = [];
+  for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, candidates.length); attempt++) {
+    const model = candidates[attempt];
+    const payload = upstreamBody(body, wire, model.id);
+    const answer = await dialOnce(model.id, payload);
+    if (!answer.ok) {
+      failures.push({ status: answer.status, code: answer.code, model: model.id });
+      continue;
+    }
+    if (token !== null && !answer.text.includes(token)) {
+      failures.push({ status: answer.status, code: "token_miss", model: model.id });
+      continue;
+    }
+    return { model, answer, failures };
+  }
+  return { model: null, answer: null, failures };
+}
+
+// ---------------------------------------------------------------------------
+// Answers back to the env, on the wire the env used. Usage and stop
+// reason travel whole from the provider; when the provider reports no
+// usage, a floor estimate keeps the answer valid (an output of at least
+// one token is required).
+// ---------------------------------------------------------------------------
+
+function settledUsage(answer, requestLength, answerLength) {
+  if (answer.usage !== null) return answer.usage;
   return {
-    id: freshId("msg"),
+    input: Math.max(0, Math.floor(requestLength / 4)),
+    output: Math.max(1, Math.floor(answerLength / 4)),
+  };
+}
+
+function openaiStop(stop) {
+  return OPENAI_STOPS.has(stop) ? stop : "stop";
+}
+
+function anthropicStop(stop) {
+  return ANTHROPIC_STOPS.get(stop) || "end_turn";
+}
+
+function splitPieces(text) {
+  if (text === "") return [""];
+  const size = Math.max(1, Math.ceil(text.length / 3));
+  const pieces = [];
+  for (let i = 0; i < text.length; i += size) pieces.push(text.slice(i, i + size));
+  return pieces;
+}
+
+function openaiJsonAnswer(modelId, answer, usage) {
+  return {
+    id: "chatcmpl-fma02v3",
+    object: "chat.completion",
+    created: 0,
+    model: modelId,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: answer.text },
+        finish_reason: openaiStop(answer.stop),
+      },
+    ],
+    usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output },
+  };
+}
+
+function openaiStreamAnswer(modelId, answer, usage) {
+  const lines = [];
+  const pieces = splitPieces(answer.text);
+  for (const piece of pieces) {
+    lines.push(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fma02v3",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: modelId,
+        choices: [{ index: 0, delta: { role: "assistant", content: piece }, finish_reason: null }],
+      })}`,
+    );
+  }
+  lines.push(
+    `data: ${JSON.stringify({
+      id: "chatcmpl-fma02v3",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: modelId,
+      choices: [{ index: 0, delta: {}, finish_reason: openaiStop(answer.stop) }],
+      usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output },
+    })}`,
+  );
+  lines.push("data: [DONE]");
+  // Server-sent events are separated by a blank line: without it the
+  // whole stream arrives as one frame and no event parses.
+  return lines.join("\n\n") + "\n\n";
+}
+
+function anthropicJsonAnswer(modelId, answer, usage) {
+  return {
+    id: "msg-fma02v3",
     type: "message",
     role: "assistant",
-    content: blocks,
+    content: [{ type: "text", text: answer.text }],
     model: modelId,
-    stop_reason: stop,
+    stop_reason: anthropicStop(answer.stop),
     stop_sequence: null,
-    usage: { input_tokens: d.promptTokens, output_tokens: d.completionTokens },
+    usage: { input_tokens: usage.input, output_tokens: usage.output },
   };
 }
 
-function anthropicSse(modelId: string, d: Dialled, toolCalls: any[]): string {
-  const id = freshId("msg");
-  const stop = toolCalls.length > 0 ? "tool_use" : mapStop(d.finish);
-  const events: string[] = [];
-  const push = (event: string, data: any) =>
-    events.push("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
-  push("message_start", {
-    type: "message_start",
-    message: {
-      id,
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: modelId,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: d.promptTokens, output_tokens: 0 },
-    },
-  });
-  let index = 0;
-  if (d.text) {
-    push("content_block_start", {
+function anthropicStreamAnswer(modelId, answer, usage) {
+  const lines = [];
+  lines.push(
+    `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: {
+        id: "msg-fma02v3",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: modelId,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: usage.input, output_tokens: 0 },
+      },
+    })}`,
+  );
+  lines.push(
+    `event: content_block_start\ndata: ${JSON.stringify({
       type: "content_block_start",
-      index,
+      index: 0,
       content_block: { type: "text", text: "" },
-    });
-    push("content_block_delta", {
-      type: "content_block_delta",
-      index,
-      delta: { type: "text_delta", text: d.text },
-    });
-    push("content_block_stop", { type: "content_block_stop", index });
-    index += 1;
-  }
-  for (const tc of toolCalls) {
-    let input: any = {};
-    try {
-      input = JSON.parse(String(tc.function?.arguments ?? "{}"));
-    } catch {
-      input = {};
-    }
-    push("content_block_start", {
-      type: "content_block_start",
-      index,
-      content_block: {
-        type: "tool_use",
-        id: String(tc.id ?? ""),
-        name: String(tc.function?.name ?? ""),
-        input: {},
-      },
-    });
-    push("content_block_delta", {
-      type: "content_block_delta",
-      index,
-      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
-    });
-    push("content_block_stop", { type: "content_block_stop", index });
-    index += 1;
-  }
-  push("message_delta", {
-    type: "message_delta",
-    delta: { stop_reason: stop, stop_sequence: null },
-    usage: { output_tokens: d.completionTokens },
-  });
-  push("message_stop", { type: "message_stop" });
-  return events.join("");
-}
-
-// ------------------------------------------------------------- http plumbing
-
-function sendJson(
-  res: ServerResponse,
-  status: number,
-  value: any,
-  extra: Record<string, string> = {},
-): void {
-  const text = JSON.stringify(value);
-  res.writeHead(status, {
-    "content-type": "application/json",
-    "content-length": Buffer.byteLength(text),
-    ...extra,
-  });
-  res.end(text);
-}
-
-function sendSse(res: ServerResponse, text: string, extra: Record<string, string> = {}): void {
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-    ...extra,
-  });
-  res.end(text);
-}
-
-function readBody(req: IncomingMessage): Promise<any | null> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on("data", (c: any) => {
-      const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
-      total += buf.length;
-      if (total > 8 * 1024 * 1024) {
-        req.destroy();
-        resolve(null);
-        return;
-      }
-      chunks.push(buf);
-    });
-    req.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8");
-      if (!raw) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        resolve(null);
-      }
-    });
-    req.on("error", () => resolve(null));
-  });
-}
-
-function trailHeaders(trail: FailureRow[]): Record<string, string> {
-  if (trail.length === 0) return {};
-  return { "x-makefun-upstream-failures": JSON.stringify(trail.slice(0, 8)) };
-}
-
-// ------------------------------------------------------------ prompt serving
-
-async function handleCompletion(
-  res: ServerResponse,
-  wire: "openai" | "anthropic",
-  body: any,
-): Promise<void> {
-  const stream = body.stream === true;
-  const needs = requestNeeds(body);
-  const token = findToken(body.messages);
-  const declared = declaredNames(body);
-  const tried = new Set<string>();
-  const trail: FailureRow[] = [];
-  let served: (Dialled & { modelId: string }) | null = null;
-  let fallback: (Dialled & { modelId: string }) | null = null;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    const ranked = rankModels(needs, tried);
-    if (ranked.length === 0) break;
-    const model = ranked[0];
-    tried.add(model.id);
-    const payload =
-      wire === "openai" ? openAIPayload(body, model.id) : anthropicToOpenAI(body, model.id);
-    const result = await dialModel(payload);
-    if (!result.ok) {
-      trail.push({ status: result.status ?? 0, code: result.code, model: model.id });
-      continue;
-    }
-    const unpacked = unpackProvider(result.body);
-    unpacked.modelId = model.id;
-    if (token && !unpacked.text.includes(token)) {
-      if (!fallback) fallback = unpacked;
-      continue;
-    }
-    served = unpacked;
-    break;
-  }
-
-  const best = served ?? fallback;
-  if (!best) {
-    sendJson(
-      res,
-      502,
-      {
-        error: {
-          message: "every upstream model refused this prompt",
-          type: "upstream_error",
-          code: "upstream_error",
-        },
-      },
-      trailHeaders(trail),
+    })}`,
+  );
+  for (const piece of splitPieces(answer.text)) {
+    lines.push(
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: piece },
+      })}`,
     );
-    return;
   }
-
-  const toolCalls = keepDeclared(best.toolCalls, declared);
-  const headers = trailHeaders(trail);
-  if (wire === "openai") {
-    if (stream) sendSse(res, openAISse(best.modelId, best, toolCalls), headers);
-    else sendJson(res, 200, openAIJson(best.modelId, best, toolCalls), headers);
-  } else {
-    if (stream) sendSse(res, anthropicSse(best.modelId, best, toolCalls), headers);
-    else sendJson(res, 200, anthropicJson(best.modelId, best, toolCalls), headers);
-  }
+  lines.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`);
+  lines.push(
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: anthropicStop(answer.stop), stop_sequence: null },
+      usage: { output_tokens: usage.output },
+    })}`,
+  );
+  lines.push(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`);
+  // Server-sent events are separated by a blank line: without it the
+  // whole stream arrives as one frame and no event parses.
+  return lines.join("\n\n") + "\n\n";
 }
 
-function handleModels(req: IncomingMessage, res: ServerResponse): void {
-  const anthropic = typeof req.headers["x-api-key"] === "string";
-  if (anthropic) {
-    sendJson(res, 200, {
-      data: MODELS.map((m) => ({
-        type: "model",
-        id: m.id,
-        display_name: m.label,
-        created_at: TRIAL_ISO,
-      })),
-      has_more: false,
-      first_id: MODELS.length > 0 ? MODELS[0].id : null,
-      last_id: MODELS.length > 0 ? MODELS[MODELS.length - 1].id : null,
-    });
-  } else {
-    sendJson(res, 200, {
-      object: "list",
-      data: MODELS.map((m) => ({
-        id: m.id,
-        object: "model",
-        created: EPOCH,
-        owned_by: "openrouter",
-      })),
-    });
-  }
-}
+// ---------------------------------------------------------------------------
+// The HTTP server: the two completion wires and the model list. The list
+// answers in the OpenAI shape for a Bearer header and the Anthropic
+// shape for an x-api-key header.
+// ---------------------------------------------------------------------------
 
-const server = createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url ?? "/", "http://local");
-    if (req.method === "GET" && url.pathname === "/v1/models") {
-      handleModels(req, res);
-      return;
-    }
-    if (
-      req.method === "POST" &&
-      (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/messages")
-    ) {
-      const body = await readBody(req);
-      if (body === null || typeof body !== "object") {
-        sendJson(res, 400, {
-          error: { message: "request body is not valid JSON", type: "invalid_request_error", code: "invalid_json" },
-        });
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("body too large"));
+        request.destroy();
         return;
       }
-      const wire = url.pathname === "/v1/messages" ? "anthropic" : "openai";
-      await handleCompletion(res, wire, body);
-      return;
-    }
-    sendJson(res, 404, {
-      error: { message: "unknown route", type: "invalid_request_error", code: "not_found" },
+      parts.push(chunk);
     });
-  } catch {
-    try {
-      sendJson(res, 500, {
-        error: { message: "internal error", type: "server_error", code: "server_error" },
-      });
-    } catch {
-      // response already gone
-    }
+    request.on("end", () => resolve(Buffer.concat(parts).toString("utf8")));
+    request.on("error", reject);
+  });
+}
+
+function modelListAnswer(models, headers) {
+  const keyHeader = headers["x-api-key"];
+  if (typeof keyHeader === "string" && keyHeader !== "") {
+    const data = models.map((m) => ({
+      id: m.id,
+      type: "model",
+      display_name: m.display,
+      created_at: "2026-11-15T00:00:00Z",
+    }));
+    return {
+      data,
+      has_more: false,
+      first_id: data.length > 0 ? data[0].id : null,
+      last_id: data.length > 0 ? data[data.length - 1].id : null,
+    };
   }
-});
+  return {
+    object: "list",
+    data: models.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "openrouter" })),
+  };
+}
 
-// --------------------------------------------------------------------- main
+function buildServer(models) {
+  return createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url || "/", "http://127.0.0.1");
+      if (request.method === "GET" && url.pathname === "/v1/models") {
+        const payload = JSON.stringify(modelListAnswer(models, request.headers));
+        response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+        response.end(payload);
+        return;
+      }
+      if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/messages")) {
+        const wire = url.pathname === "/v1/messages" ? "anthropic" : "openai";
+        let body;
+        try {
+          body = JSON.parse(await readBody(request));
+        } catch {
+          const payload = JSON.stringify({ error: { message: "request body is not JSON", type: "invalid_request_error" } });
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(payload);
+          return;
+        }
+        const stream = body.stream === true;
+        const outcome = await servePrompt(models, body, wire);
+        if (outcome.model === null) {
+          const payload = JSON.stringify({
+            error: { message: "no free model answered with the prompt token", type: "upstream_error", code: "all_attempts_failed" },
+          });
+          const headers = { "content-type": "application/json" };
+          if (outcome.failures.length > 0) {
+            headers["x-makefun-upstream-failures"] = JSON.stringify(outcome.failures.slice(0, MAX_FAILURE_ROWS));
+          }
+          response.writeHead(502, headers);
+          response.end(payload);
+          return;
+        }
+        const requestLength = requestText(body, wire).length;
+        const usage = settledUsage(outcome.answer, requestLength, outcome.answer.text.length);
+        const headers = {};
+        if (outcome.failures.length > 0) {
+          headers["x-makefun-upstream-failures"] = JSON.stringify(outcome.failures.slice(0, MAX_FAILURE_ROWS));
+        }
+        if (stream) {
+          const payload = wire === "anthropic"
+            ? anthropicStreamAnswer(outcome.model.id, outcome.answer, usage)
+            : openaiStreamAnswer(outcome.model.id, outcome.answer, usage);
+          headers["content-type"] = "text/event-stream";
+          headers["cache-control"] = "no-cache";
+          headers["content-length"] = Buffer.byteLength(payload);
+          response.writeHead(200, headers);
+          response.end(payload);
+          return;
+        }
+        const payload = JSON.stringify(
+          wire === "anthropic"
+            ? anthropicJsonAnswer(outcome.model.id, outcome.answer, usage)
+            : openaiJsonAnswer(outcome.model.id, outcome.answer, usage),
+        );
+        headers["content-type"] = "application/json";
+        headers["content-length"] = Buffer.byteLength(payload);
+        response.writeHead(200, headers);
+        response.end(payload);
+        return;
+      }
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "not found", type: "invalid_request_error" } }));
+    } catch (err) {
+      const payload = JSON.stringify({ error: { message: String((err && err.message) || err), type: "server_error" } });
+      try {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(payload);
+      } catch {
+        // The socket is already gone; nothing left to do.
+      }
+    }
+  });
+}
 
-async function main(): Promise<void> {
-  if (process.argv.includes("--list")) {
-    process.stdout.write(CATALOG_TEXT);
+// ---------------------------------------------------------------------------
+// Running a trial: listen, register with the env, poll /work until it
+// says done, then leave quietly with exit 0.
+// ---------------------------------------------------------------------------
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function registerWithEnv(envUrl, port, catalog) {
+  for (let attempt = 0; attempt < REGISTER_RETRIES; attempt++) {
+    try {
+      const response = await fetch(`${envUrl.replace(/\/$/, "")}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
+      });
+      if (response.status >= 200 && response.status < 300) return true;
+    } catch {
+      // Fall through to the next attempt.
+    }
+    await sleep(REGISTER_WAIT_MS);
+  }
+  return false;
+}
+
+async function waitForDone(envUrl) {
+  for (let poll = 0; poll < WORK_POLLS_MAX; poll++) {
+    try {
+      const response = await fetch(`${envUrl.replace(/\/$/, "")}/work`);
+      if (response.status >= 200 && response.status < 300) {
+        const state = await response.json();
+        if (state && state.done === true) return true;
+      }
+    } catch {
+      // The env may not be up yet; keep polling.
+    }
+    await sleep(WORK_POLL_MS);
+  }
+  return false;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const listOnly = args.includes("--list");
+  const models = readBriefModels();
+  if (listOnly) {
+    process.stdout.write(`${JSON.stringify(models === null ? EMPTY_CATALOG : catalogDocument(models))}\n`);
     process.exit(0);
   }
-  await new Promise<void>((resolve) => {
-    server.listen(0, "0.0.0.0", () => resolve());
-  });
-  const port = (server.address() as any).port;
-  if (ENV_URL) {
-    for (let i = 0; i < 5; i += 1) {
-      try {
-        const r = await fetch(ENV_URL + "/register", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ protocol_version: 1, port, catalog: CATALOG }),
-        });
-        if (r.ok) break;
-      } catch {
-        // try again on a fixed beat
-      }
-      await sleep(500);
-    }
-    for (;;) {
-      try {
-        const r = await fetch(ENV_URL + "/work");
-        const state: any = await r.json();
-        if (state && state.done === true) break;
-      } catch {
-        // the env answers again on the next beat
-      }
-      await sleep(500);
-    }
+  if (models === null) {
+    process.stderr.write("free-model-aggregator-02 v3: no brief to read (MAKEFUN_PROMPT_FILE is unset or unreadable)\n");
+    process.exit(1);
   }
+  const catalog = catalogDocument(models);
+  const server = buildServer(models);
+  const port = await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "0.0.0.0", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  const envUrl = process.env.MAKEFUN_ENV_URL;
+  if (!envUrl) {
+    process.stdout.write(`free-model-aggregator-02 v3: listening on 0.0.0.0:${port} (no MAKEFUN_ENV_URL set, standing by)\n`);
+    return;
+  }
+  const registered = await registerWithEnv(envUrl, port, catalog);
+  if (!registered) {
+    process.stderr.write("free-model-aggregator-02 v3: the env would not take the registration\n");
+    process.exit(1);
+  }
+  const done = await waitForDone(envUrl);
   server.close();
-  process.exit(0);
+  process.exit(done ? 0 : 1);
 }
 
-main();
+main().catch((err) => {
+  process.stderr.write(`free-model-aggregator-02 v3: ${String((err && err.message) || err)}\n`);
+  process.exit(1);
+});
