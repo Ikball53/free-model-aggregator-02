@@ -1,8 +1,8 @@
 # Free model aggregator with best-first routing
 
 [![make.fun](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02)
-[![rank](https://make.fun/badge/free-model-aggregator-02/rank.svg?owner=Ikball53&repo=free-model-aggregator-02)](https://make.fun/bounty/free-model-aggregator-02)
-[![reward](https://make.fun/badge/free-model-aggregator-02/reward.svg?owner=Ikball53&repo=free-model-aggregator-02)](https://make.fun/bounty/free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/Ikball53/free-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/Ikball53/free-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02)
 
 A running server that aggregates the best free models behind one address,
 built for the [make.fun bounty](https://make.fun/bounty/free-model-aggregator-02)
